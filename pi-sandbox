@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+
+# pylint: disable=missing-docstring
+
+import functools
+import importlib.util
+import os
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+
+def main():
+    load_config()
+    target, extra_path = parse_args()
+    bwrap = ["bwrap", *bwrap_options(), *target]
+    command = f'PATH="$PATH{extra_path}" exec {shlex.join(bwrap)}'
+    os.execvp("nix-shell", [
+        "nix-shell",
+        "--packages", *nix_shell_packages(),
+        "--run", command,
+    ])
+
+
+def load_config():
+    # Alias so config's `import pi_sandbox` finds us, not a second instance.
+    sys.modules.setdefault("pi_sandbox", sys.modules[__name__])
+    project_dir = Path.cwd() / ".pi" / "sandbox"
+    # Later wins: project dir over global, config.local.py over config.py.
+    paths = [
+        Path.home() / ".pi" / "agent" / "sandbox" / "config.py",
+        project_dir / "config.py",
+        project_dir / "config.local.py",
+    ]
+    for path in paths:
+        if path.exists():
+            exec_config(path)
+
+
+def exec_config(path):
+    sys.path.append(str(path.parent))
+    spec = importlib.util.spec_from_file_location("pi_sandbox_config", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+
+def parse_args():
+    args = sys.argv[1:]
+    if "--bash" in args:
+        return ["bash", *(a for a in args if a != "--bash")], ""
+    pi = shutil.which("pi")
+    if pi is None:
+        sys.exit("pi-sandbox: 'pi' not found on PATH")
+    pi = os.path.realpath(pi)
+    return [pi, *args], f":{Path(pi).parent}"
+
+
+def bwrap_options():
+    cert = "/etc/ssl/certs/ca-certificates.crt"
+    user = "user"
+    home = f"/home/{user}"
+    cwd = str(Path.cwd())
+    host_dot_pi = str(Path.home() / ".pi")
+    nix_conf = os.path.realpath("/etc/nix/nix.conf")
+    return [
+        "--unshare-all",
+        "--die-with-parent",
+        "--share-net",
+        "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+        "--ro-bind", cert, cert,
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--setenv", "TMPDIR", "/tmp",
+        "--ro-bind", "/nix/store", "/nix/store",
+        "--bind", "/nix/var/nix/daemon-socket", "/nix/var/nix/daemon-socket",
+        "--ro-bind", "/nix/var/nix/profiles", "/nix/var/nix/profiles",
+        "--ro-bind", nix_conf, "/etc/nix/nix.conf",
+        "--setenv", "NIX_REMOTE", "daemon",
+        "--tmpfs", "/home",
+        "--dir", home,
+        "--setenv", "HOME", home,
+        "--setenv", "USER", user,
+        "--setenv", "PS1", r"[pi-sandbox] \w \$ ",
+        "--bind", host_dot_pi, f"{home}/.pi",
+        "--bind", cwd, cwd,
+        "--chdir", cwd,
+    ]
+
+
+def nix_shell_packages():
+    return ["bubblewrap", "nodejs", "ncurses", "which", "nix"]
+
+
+def override(arg):
+    """Replace a function, injecting the previous version as the first argument
+    so overrides can chain. Used as ``@pi_sandbox.override`` (replaces
+    ``pi_sandbox.<name>``) or ``@pi_sandbox.override(target)`` (replaces
+    ``target`` wherever it lives)."""
+    if not callable(arg):
+        raise TypeError(
+            f"@pi_sandbox.override expects a function; "
+            f"got {type(arg).__name__}")
+    home = sys.modules.get(arg.__module__)
+    if home is not None and getattr(home, arg.__name__, None) is arg:
+        return lambda fn: _install(home, arg.__name__, arg, fn)
+    ps_module = sys.modules[__name__]
+    if not hasattr(ps_module, arg.__name__):
+        raise AttributeError(
+            f"pi_sandbox has no attribute {arg.__name__!r}; for targets "
+            f"outside pi_sandbox, use the explicit form: "
+            f"@pi_sandbox.override(<module>.{arg.__name__})")
+    return _install(
+        ps_module, arg.__name__, getattr(ps_module, arg.__name__), arg)
+
+
+def _install(module, name, target, fn):
+    """Install `fn` at `module.name`, with `target` curried as first arg."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(target, *args, **kwargs)
+    # Rewrite so a later @pi_sandbox.override(wrapper) routes here, not to fn's
+    # original module.
+    wrapper.__module__ = module.__name__
+    setattr(module, name, wrapper)
+    return wrapper
+
+
+if __name__ == "__main__":
+    main()
