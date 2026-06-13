@@ -13,9 +13,11 @@ from pathlib import Path
 
 def main():
     load_config()
-    target, extra_path = parse_args()
-    bwrap = ["bwrap", *bwrap_options(), *target]
-    command = f'PATH="$PATH{extra_path}" exec {shlex.join(bwrap)}'
+    pi = find_pi()
+    parsed = parse_args()
+    program = "bash" if parsed.get("bash") else pi
+    bwrap = ["bwrap", *bwrap_options(), program, *parsed["args"]]
+    command = f'PATH="$PATH:{Path(pi).parent}" exec {shlex.join(bwrap)}'
     os.execvp("nix-shell", [
         "nix-shell",
         "--packages", *nix_shell_packages(),
@@ -48,12 +50,15 @@ def exec_config(path):
 def parse_args():
     args = sys.argv[1:]
     if "--bash" in args:
-        return ["bash", *(a for a in args if a != "--bash")], ""
+        return {"bash": True, "args": [a for a in args if a != "--bash"]}
+    return {"args": args}
+
+
+def find_pi():
     pi = shutil.which("pi")
     if pi is None:
         sys.exit("pi-sandbox: 'pi' not found on PATH")
-    pi = os.path.realpath(pi)
-    return [pi, *args], f":{Path(pi).parent}"
+    return os.path.realpath(pi)
 
 
 def bwrap_options():
